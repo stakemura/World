@@ -6,6 +6,8 @@
 #ifndef WORLD_COMMON_H_
 #define WORLD_COMMON_H_
 
+#include <math.h>
+#include <stddef.h>
 #include "world/fft.h"
 #include "world/macrodefinitions.h"
 
@@ -109,7 +111,7 @@ void NuttallWindow(int y_length, double *y);
 // 0.999999999999 (1 - world::kMySafeGuardMinimum).
 //-----------------------------------------------------------------------------
 inline double GetSafeAperiodicity(double x) {
-  return MyMaxDouble(0.001, MyMinDouble(0.999999999999, x));
+  return fmax(0.001, fmin(0.999999999999, x));
 }
 
 //-----------------------------------------------------------------------------
@@ -134,5 +136,30 @@ void GetMinimumPhaseSpectrum(const MinimumPhaseAnalysis *minimum_phase);
 void DestroyMinimumPhaseAnalysis(MinimumPhaseAnalysis *minimum_phase);
 
 WORLD_END_C_DECLS
+
+//-----------------------------------------------------------------------------
+// These functions are used to optimize allocation of two dimensional array
+template<typename T>
+inline T** Create2DArray(size_t rows, size_t cols) {
+  if (rows == 0)
+    return nullptr;
+
+  T** array2d = new T*[rows];
+  T* temp = new T[rows * cols];
+  for (size_t i = 0; i < rows; ++i) {
+    array2d[i] = temp + i * cols;
+  }
+  return array2d;
+}
+
+// Delete a two dimensional dynamic array
+template<typename T>
+inline void Delete2DArray(T **array2d) {
+  if(array2d == nullptr)
+    return;
+
+  delete[] array2d[0];
+  delete[] array2d;
+}
 
 #endif  // WORLD_COMMON_H_

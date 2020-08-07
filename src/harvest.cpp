@@ -8,11 +8,18 @@
 #include "world/harvest.h"
 
 #include <math.h>
+#include <algorithm>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #include "world/common.h"
 #include "world/constantnumbers.h"
 #include "world/fft.h"
 #include "world/matlabfunctions.h"
+
+#define NUM_HARMONICS 6
 
 //-----------------------------------------------------------------------------
 // struct for RawEventByHarvest()
@@ -32,9 +39,35 @@ typedef struct {
   double *dip_interval_locations;
   double *dip_intervals;
   int number_of_dips;
+  int *negative_going_points;
+  int *edges;
+  double *fine_edges;
 } ZeroCrossings;
 
 namespace {
+struct GetRawF0Temp {
+  ZeroCrossings zero_crossings;
+  double *filtered_signal;
+  double *band_pass_filter;
+  fft_complex *band_pass_filter_spectrum;
+
+  double *interp1_s;
+  int *interp1_k;
+};
+
+struct RefineF0Temp {
+  fft_complex *main_spectrum;
+  fft_complex *diff_spectrum;
+  int *base_index;
+  double *main_window;
+  double *diff_window;
+  double *power_spectrum;
+  double *numerator_i;
+  double *base_time;
+  int *safe_index;
+  ForwardRealFFT *forward_real_fft_list;
+};
+
 //-----------------------------------------------------------------------------
 // Since the waveform of beginning and ending after decimate include noise,
 // the input waveform is extended. This is the processing for the
@@ -97,9 +130,9 @@ static void GetWaveformAndSpectrum(const double *x, int x_length,
 // input signal and band-pass filter.
 //-----------------------------------------------------------------------------
 static void GetFilteredSignal(double boundary_f0, int fft_size, double fs,
-    const fft_complex *y_spectrum, int y_length, double *filtered_signal) {
-  int filter_length_half = matlab_round(fs / boundary_f0 * 2.0);
-  double *band_pass_filter = new double[fft_size];
+    const fft_complex *y_spectrum, int y_length, double *filtered_signal,
+    double *band_pass_filter, fft_complex *band_pass_filter_spectrum) {
+  int filter_length_half = lround(fs / boundary_f0 * 2.0);
   NuttallWindow(filter_length_half * 2 + 1, band_pass_filter);
   for (int i = -filter_length_half; i <= filter_length_half; ++i)
     band_pass_filter[i + filter_length_half] *=
@@ -107,7 +140,6 @@ static void GetFilteredSignal(double boundary_f0, int fft_size, double fs,
   for (int i = filter_length_half * 2 + 1; i < fft_size; ++i)
     band_pass_filter[i] = 0.0;
 
-  fft_complex *band_pass_filter_spectrum = new fft_complex[fft_size];
   fft_plan forwardFFT = fft_plan_dft_r2c_1d(fft_size, band_pass_filter,
     band_pass_filter_spectrum, FFT_ESTIMATE);
   fft_execute(forwardFFT);
@@ -143,8 +175,6 @@ static void GetFilteredSignal(double boundary_f0, int fft_size, double fs,
 
   fft_destroy_plan(inverseFFT);
   fft_destroy_plan(forwardFFT);
-  delete[] band_pass_filter_spectrum;
-  delete[] band_pass_filter;
 }
 
 //-----------------------------------------------------------------------------
@@ -160,27 +190,23 @@ static inline int CheckEvent(int x) {
 // negative.
 //-----------------------------------------------------------------------------
 static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
-    double fs, double *interval_locations, double *intervals) {
-  int *negative_going_points = new int[y_length];
+    double fs, double *interval_locations, double *intervals,
+    int *negative_going_points, int *edges, double *fine_edges) {
 
   for (int i = 0; i < y_length - 1; ++i)
     negative_going_points[i] =
       0.0 < filtered_signal[i] && filtered_signal[i + 1] <= 0.0 ? i + 1 : 0;
   negative_going_points[y_length - 1] = 0;
 
-  int *edges = new int[y_length];
   int count = 0;
   for (int i = 0; i < y_length; ++i)
     if (negative_going_points[i] > 0)
       edges[count++] = negative_going_points[i];
 
   if (count < 2) {
-    delete[] edges;
-    delete[] negative_going_points;
     return 0;
   }
 
-  double *fine_edges = new double[count];
   for (int i = 0; i < count; ++i)
     fine_edges[i] = edges[i] - filtered_signal[edges[i] - 1] /
       (filtered_signal[edges[i]] - filtered_signal[edges[i] - 1]);
@@ -190,11 +216,26 @@ static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
     interval_locations[i] = (fine_edges[i] + fine_edges[i + 1]) / 2.0 / fs;
   }
 
-  delete[] fine_edges;
-  delete[] edges;
-  delete[] negative_going_points;
   return count - 1;
 }
+
+//-----------------------------------------------------------------------------
+// InitializeZeroCrossings() allocates the memory of array in the struct
+//-----------------------------------------------------------------------------
+static void InitializeZeroCrossings(ZeroCrossings *zero_crossings, int y_length) {
+    zero_crossings->negative_interval_locations = new double[y_length];
+    zero_crossings->positive_interval_locations = new double[y_length];
+    zero_crossings->peak_interval_locations = new double[y_length];
+    zero_crossings->dip_interval_locations = new double[y_length];
+    zero_crossings->negative_intervals = new double[y_length];
+    zero_crossings->positive_intervals = new double[y_length];
+    zero_crossings->peak_intervals = new double[y_length];
+    zero_crossings->dip_intervals = new double[y_length];
+    zero_crossings->negative_going_points = new int[y_length];
+    zero_crossings->edges = new int[y_length];
+    zero_crossings->fine_edges = new double[y_length];
+}
+
 
 //-----------------------------------------------------------------------------
 // GetFourZeroCrossingIntervals() calculates four zero-crossing intervals.
@@ -203,63 +244,46 @@ static int ZeroCrossingEngine(const double *filtered_signal, int y_length,
 // (3) Peak, and (4) dip. (3) and (4) are calculated from the zero-crossings of
 // the differential of waveform.
 //-----------------------------------------------------------------------------
-static void GetFourZeroCrossingIntervals(double *filtered_signal, int y_length,
+static void GetFourZeroCrossingIntervals(GetRawF0Temp &tmp, int y_length,
     double actual_fs, ZeroCrossings *zero_crossings) {
-  int maximum_number = y_length;
-  zero_crossings->negative_interval_locations = new double[maximum_number];
-  zero_crossings->positive_interval_locations = new double[maximum_number];
-  zero_crossings->peak_interval_locations = new double[maximum_number];
-  zero_crossings->dip_interval_locations = new double[maximum_number];
-  zero_crossings->negative_intervals = new double[maximum_number];
-  zero_crossings->positive_intervals = new double[maximum_number];
-  zero_crossings->peak_intervals = new double[maximum_number];
-  zero_crossings->dip_intervals = new double[maximum_number];
 
-  zero_crossings->number_of_negatives = ZeroCrossingEngine(filtered_signal,
-      y_length, actual_fs, zero_crossings->negative_interval_locations,
-      zero_crossings->negative_intervals);
+  zero_crossings->number_of_negatives = ZeroCrossingEngine(tmp.filtered_signal,
+    y_length, actual_fs, zero_crossings->negative_interval_locations,
+    zero_crossings->negative_intervals,
+    zero_crossings->negative_going_points,
+    zero_crossings->edges, zero_crossings->fine_edges);
 
-  for (int i = 0; i < y_length; ++i) filtered_signal[i] = -filtered_signal[i];
-  zero_crossings->number_of_positives = ZeroCrossingEngine(filtered_signal,
-      y_length, actual_fs, zero_crossings->positive_interval_locations,
-      zero_crossings->positive_intervals);
+  for (int i = 0; i < y_length; ++i) tmp.filtered_signal[i] = -tmp.filtered_signal[i];
+  zero_crossings->number_of_positives = ZeroCrossingEngine(tmp.filtered_signal,
+    y_length, actual_fs, zero_crossings->positive_interval_locations,
+    zero_crossings->positive_intervals,
+    zero_crossings->negative_going_points,
+    zero_crossings->edges, zero_crossings->fine_edges);
 
-  for (int i = 0; i < y_length - 1; ++i) filtered_signal[i] =
-    filtered_signal[i] - filtered_signal[i + 1];
-  zero_crossings->number_of_peaks = ZeroCrossingEngine(filtered_signal,
-      y_length - 1, actual_fs, zero_crossings->peak_interval_locations,
-      zero_crossings->peak_intervals);
+  for (int i = 0; i < y_length - 1; ++i) tmp.filtered_signal[i] =
+    tmp.filtered_signal[i] - tmp.filtered_signal[i + 1];
+  zero_crossings->number_of_peaks = ZeroCrossingEngine(tmp.filtered_signal,
+    y_length - 1, actual_fs, zero_crossings->peak_interval_locations,
+    zero_crossings->peak_intervals,
+    zero_crossings->negative_going_points,
+    zero_crossings->edges, zero_crossings->fine_edges);
 
   for (int i = 0; i < y_length - 1; ++i)
-    filtered_signal[i] = -filtered_signal[i];
-  zero_crossings->number_of_dips = ZeroCrossingEngine(filtered_signal,
-      y_length - 1, actual_fs, zero_crossings->dip_interval_locations,
-      zero_crossings->dip_intervals);
-}
-
-static void GetF0CandidateContourSub(const double * const *interpolated_f0_set,
-    int f0_length, double f0_floor, double f0_ceil, double boundary_f0,
-    double *f0_candidate) {
-  double upper = boundary_f0 * 1.1;
-  double lower = boundary_f0 * 0.9;
-  for (int i = 0; i < f0_length; ++i) {
-    f0_candidate[i] = (interpolated_f0_set[0][i] +
-      interpolated_f0_set[1][i] + interpolated_f0_set[2][i] +
-      interpolated_f0_set[3][i]) / 4.0;
-
-    if (f0_candidate[i] > upper || f0_candidate[i] < lower ||
-        f0_candidate[i] > f0_ceil || f0_candidate[i] < f0_floor)
-      f0_candidate[i] = 0.0;
-  }
+    tmp.filtered_signal[i] = -tmp.filtered_signal[i];
+  zero_crossings->number_of_dips = ZeroCrossingEngine(tmp.filtered_signal,
+    y_length - 1, actual_fs, zero_crossings->dip_interval_locations,
+    zero_crossings->dip_intervals,
+    zero_crossings->negative_going_points,
+    zero_crossings->edges, zero_crossings->fine_edges);
 }
 
 //-----------------------------------------------------------------------------
 // GetF0CandidateContour() calculates the F0 candidate contour in 1-ch signal.
-// Calculation of F0 candidates is carried out in GetF0CandidatesSub().
 //-----------------------------------------------------------------------------
 static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
-    double boundary_f0, double f0_floor, double f0_ceil,
-    const double *temporal_positions, int f0_length, double *f0_candidate) {
+    double boundary_f0, const HarvestOption *option,
+    const double *temporal_positions, int f0_length, double *f0_candidate,
+    double *const *interpolated_f0_set, double *interp1_s, int *interp1_k) {
   if (0 == CheckEvent(zero_crossings->number_of_negatives - 2) *
       CheckEvent(zero_crossings->number_of_positives - 2) *
       CheckEvent(zero_crossings->number_of_peaks - 2) *
@@ -268,34 +292,43 @@ static void GetF0CandidateContour(const ZeroCrossings *zero_crossings,
     return;
   }
 
-  double *interpolated_f0_set[4];
-  for (int i = 0; i < 4; ++i)
-    interpolated_f0_set[i] = new double[f0_length];
-
-  interp1(zero_crossings->negative_interval_locations,
-      zero_crossings->negative_intervals,
-      zero_crossings->number_of_negatives,
-      temporal_positions, f0_length, interpolated_f0_set[0]);
-  interp1(zero_crossings->positive_interval_locations,
-      zero_crossings->positive_intervals,
-      zero_crossings->number_of_positives,
-      temporal_positions, f0_length, interpolated_f0_set[1]);
-  interp1(zero_crossings->peak_interval_locations,
+  interp1a(zero_crossings->negative_interval_locations,
+      zero_crossings->negative_intervals, zero_crossings->number_of_negatives,
+      temporal_positions, f0_length, interpolated_f0_set[0],
+      interp1_s, interp1_k);
+  interp1a(zero_crossings->positive_interval_locations,
+      zero_crossings->positive_intervals, zero_crossings->number_of_positives,
+      temporal_positions, f0_length, interpolated_f0_set[1],
+      interp1_s, interp1_k);
+  interp1a(zero_crossings->peak_interval_locations,
       zero_crossings->peak_intervals, zero_crossings->number_of_peaks,
-      temporal_positions, f0_length, interpolated_f0_set[2]);
-  interp1(zero_crossings->dip_interval_locations,
+      temporal_positions, f0_length, interpolated_f0_set[2],
+      interp1_s, interp1_k);
+  interp1a(zero_crossings->dip_interval_locations,
       zero_crossings->dip_intervals, zero_crossings->number_of_dips,
-      temporal_positions, f0_length, interpolated_f0_set[3]);
+      temporal_positions, f0_length, interpolated_f0_set[3],
+      interp1_s, interp1_k);
 
-  GetF0CandidateContourSub(interpolated_f0_set, f0_length, f0_floor,
-      f0_ceil, boundary_f0, f0_candidate);
-  for (int i = 0; i < 4; ++i) delete[] interpolated_f0_set[i];
+  double upper = boundary_f0 * 1.1;
+  double lower = boundary_f0 * 0.9;
+  for (int i = 0; i < f0_length; ++i) {
+    f0_candidate[i] = (interpolated_f0_set[0][i] +
+                       interpolated_f0_set[1][i] + interpolated_f0_set[2][i] +
+                       interpolated_f0_set[3][i]) / 4.0;
+
+    if (f0_candidate[i] > upper || f0_candidate[i] < lower ||
+        f0_candidate[i] > option->f0_ceil || f0_candidate[i] < option->f0_floor)
+      f0_candidate[i] = 0.0;
+  }
 }
 
 //-----------------------------------------------------------------------------
 // DestroyZeroCrossings() frees the memory of array in the struct
 //-----------------------------------------------------------------------------
 static void DestroyZeroCrossings(ZeroCrossings *zero_crossings) {
+  delete[] zero_crossings->fine_edges;
+  delete[] zero_crossings->edges;
+  delete[] zero_crossings->negative_going_points;
   delete[] zero_crossings->negative_interval_locations;
   delete[] zero_crossings->positive_interval_locations;
   delete[] zero_crossings->peak_interval_locations;
@@ -307,39 +340,67 @@ static void DestroyZeroCrossings(ZeroCrossings *zero_crossings) {
 }
 
 //-----------------------------------------------------------------------------
-// GetF0CandidateFromRawEvent() f0 candidate contour in 1-ch signal
-//-----------------------------------------------------------------------------
-static void GetF0CandidateFromRawEvent(double boundary_f0, double fs,
-    const fft_complex *y_spectrum, int y_length, int fft_size, double f0_floor,
-    double f0_ceil, const double *temporal_positions, int f0_length,
-    double *f0_candidate) {
-  double *filtered_signal = new double[fft_size];
-  GetFilteredSignal(boundary_f0, fft_size, fs, y_spectrum,
-      y_length, filtered_signal);
-
-  ZeroCrossings zero_crossings = { 0 };
-  GetFourZeroCrossingIntervals(filtered_signal, y_length, fs,
-      &zero_crossings);
-
-  GetF0CandidateContour(&zero_crossings, boundary_f0, f0_floor, f0_ceil,
-      temporal_positions, f0_length, f0_candidate);
-
-  DestroyZeroCrossings(&zero_crossings);
-  delete[] filtered_signal;
-}
-
-//-----------------------------------------------------------------------------
 // GetRawF0Candidates() calculates f0 candidates in all channels.
 //-----------------------------------------------------------------------------
 static void GetRawF0Candidates(const double *boundary_f0_list,
     int number_of_bands, double actual_fs, int y_length,
     const double *temporal_positions, int f0_length,
-    const fft_complex *y_spectrum, int fft_size, double f0_floor,
-    double f0_ceil, double **raw_f0_candidates) {
-  for (int i = 0; i < number_of_bands; ++i)
-    GetF0CandidateFromRawEvent(boundary_f0_list[i], actual_fs, y_spectrum,
-        y_length, fft_size, f0_floor, f0_ceil, temporal_positions, f0_length,
-        raw_f0_candidates[i]);
+    const fft_complex *y_spectrum, int fft_size, const HarvestOption *option,
+    double *const *raw_f0_candidates) {
+
+  double **interpolated_f0_set = Create2DArray<double>(4, f0_length);
+
+  GetRawF0Temp *tmps = new GetRawF0Temp[option->num_thread];
+  for (int thread_id = 0; thread_id < option->num_thread; thread_id++) {
+    GetRawF0Temp &tmp = tmps[thread_id];
+
+    InitializeZeroCrossings(&tmp.zero_crossings, y_length);
+    tmp.filtered_signal = new double[fft_size];
+    tmp.band_pass_filter = new double[fft_size];
+    tmp.band_pass_filter_spectrum = new fft_complex[fft_size];
+
+    tmp.interp1_s = new double[f0_length];
+    tmp.interp1_k = new int[f0_length];
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(option->num_thread)
+#endif
+  for (int i = 0; i < number_of_bands; ++i) {
+#ifdef _OPENMP
+    int thread_id = omp_get_thread_num();
+#else
+    const int thread_id = 0;
+#endif
+    GetRawF0Temp &tmp = tmps[thread_id];
+
+    double boundary_f0 = boundary_f0_list[i];
+
+    GetFilteredSignal(boundary_f0, fft_size, actual_fs, y_spectrum,
+      y_length, tmp.filtered_signal,
+      tmp.band_pass_filter, tmp.band_pass_filter_spectrum);
+
+    GetFourZeroCrossingIntervals(tmp, y_length, actual_fs,
+      &tmp.zero_crossings);
+
+    GetF0CandidateContour(&tmp.zero_crossings, boundary_f0, option,
+      temporal_positions, f0_length, raw_f0_candidates[i],
+      interpolated_f0_set, tmp.interp1_s, tmp.interp1_k);
+  }
+
+  Delete2DArray<double>(interpolated_f0_set);
+
+  for (int thread_id = option->num_thread-1; thread_id >= 0; thread_id--) {
+    GetRawF0Temp &tmp = tmps[thread_id];
+
+    delete[] tmp.interp1_k;
+    delete[] tmp.interp1_s;
+    delete[] tmp.band_pass_filter_spectrum;
+    delete[] tmp.band_pass_filter;
+    delete[] tmp.filtered_signal;
+    DestroyZeroCrossings(&tmp.zero_crossings);
+  }
+  delete[] tmps;
 }
 
 //-----------------------------------------------------------------------------
@@ -348,9 +409,8 @@ static void GetRawF0Candidates(const double *boundary_f0_list,
 static int DetectOfficialF0CandidatesSub1(const int *vuv,
     int number_of_channels, int *st, int *ed) {
   int number_of_voiced_sections = 0;
-  int tmp;
   for (int i = 1; i < number_of_channels; ++i) {
-    tmp = vuv[i] - vuv[i - 1];
+    int tmp = vuv[i] - vuv[i - 1];
     if (tmp == 1) st[number_of_voiced_sections] = i;
     if (tmp == -1) ed[number_of_voiced_sections++] = i;
   }
@@ -362,15 +422,14 @@ static int DetectOfficialF0CandidatesSub1(const int *vuv,
 // DetectOfficialF0CandidatesSub2() calculates F0 candidates in a frame
 //-----------------------------------------------------------------------------
 static int DetectOfficialF0CandidatesSub2(const int *vuv,
-    const double * const *raw_f0_candidates, int index,
+    const double *const *raw_f0_candidates, int index,
     int number_of_voiced_sections, const int *st, const int *ed,
-    int max_candidates, double *f0_list) {
+    const HarvestOption *option, int max_candidates, double *f0_list) {
   int number_of_candidates = 0;
-  double tmp_f0;
   for (int i = 0; i < number_of_voiced_sections; ++i) {
-    if (ed[i] - st[i] < 10) continue;
+    if (ed[i] - st[i] < option->f0_sub2) continue;
 
-    tmp_f0 = 0.0;
+    double tmp_f0 = 0.0;
     for (int j = st[i]; j < ed[i]; ++j)
       tmp_f0 += raw_f0_candidates[j][index];
     tmp_f0 /= (ed[i] - st[i]);
@@ -385,37 +444,36 @@ static int DetectOfficialF0CandidatesSub2(const int *vuv,
 // DetectOfficialF0Candidates() detectes F0 candidates from multi-channel
 // candidates.
 //-----------------------------------------------------------------------------
-static int DetectOfficialF0Candidates(const double * const * raw_f0_candidates,
-    int number_of_channels, int f0_length, int max_candidates,
-    double **f0_candidates) {
+static int DetectOfficialF0Candidates(const double *const * raw_f0_candidates,
+    int number_of_channels, int f0_length, const HarvestOption *option,
+    int max_candidates, double *const *f0_candidates) {
   int number_of_candidates = 0;
 
   int *vuv = new int[number_of_channels];
   int *st = new int[number_of_channels];
   int *ed = new int[number_of_channels];
-  int number_of_voiced_sections;
   for (int i = 0; i < f0_length; ++i) {
     for (int j = 0; j < number_of_channels; ++j)
       vuv[j] = raw_f0_candidates[j][i] > 0 ? 1 : 0;
     vuv[0] = vuv[number_of_channels - 1] = 0;
-    number_of_voiced_sections = DetectOfficialF0CandidatesSub1(vuv,
+    int number_of_voiced_sections = DetectOfficialF0CandidatesSub1(vuv,
       number_of_channels, st, ed);
     number_of_candidates = MyMaxInt(number_of_candidates,
       DetectOfficialF0CandidatesSub2(vuv, raw_f0_candidates, i,
-        number_of_voiced_sections, st, ed, max_candidates, f0_candidates[i]));
+        number_of_voiced_sections, st, ed, option, max_candidates, f0_candidates[i]));
   }
 
-  delete[] vuv;
-  delete[] st;
   delete[] ed;
+  delete[] st;
+  delete[] vuv;
   return number_of_candidates;
 }
 
 //-----------------------------------------------------------------------------
 // OverlapF0Candidates() spreads the candidates to anteroposterior frames.
 //-----------------------------------------------------------------------------
-static void OverlapF0Candidates(int f0_length, int number_of_candidates,
-    double **f0_candidates) {
+static inline void OverlapF0Candidates(int f0_length, int number_of_candidates,
+    double *const *f0_candidates) {
   int n = 3;
   for (int i = 1; i <= n; ++i)
     for (int j = 0; j < number_of_candidates; ++j) {
@@ -431,11 +489,11 @@ static void OverlapF0Candidates(int f0_length, int number_of_candidates,
 //-----------------------------------------------------------------------------
 // GetBaseIndex() calculates the temporal positions for windowing.
 //-----------------------------------------------------------------------------
-static void GetBaseIndex(double current_position, const double *base_time,
+static inline void GetBaseIndex(double current_position, const double *base_time,
     int base_time_length, double fs, int *base_index) {
   // First-aid treatment
   int basic_index =
-    matlab_round((current_position + base_time[0]) * fs + 0.001);
+    lround((current_position + base_time[0]) * fs + 0.001);
 
   for (int i = 0; i < base_time_length; ++i) base_index[i] = basic_index + i;
 }
@@ -443,15 +501,13 @@ static void GetBaseIndex(double current_position, const double *base_time,
 //-----------------------------------------------------------------------------
 // GetMainWindow() generates the window function.
 //-----------------------------------------------------------------------------
-static void GetMainWindow(double current_position, const int *base_index,
+static inline void GetMainWindow(double current_position, const int *base_index,
     int base_time_length, double fs, double window_length_in_time,
     double *main_window) {
-  double tmp = 0.0;
   for (int i = 0; i < base_time_length; ++i) {
-    tmp = (base_index[i] - 1.0) / fs - current_position;
-    main_window[i] = 0.42 +
-      0.5 * cos(2.0 * world::kPi * tmp / window_length_in_time) +
-      0.08 * cos(4.0 * world::kPi * tmp / window_length_in_time);
+    double tmp = (base_index[i] - 1.0) / fs - current_position;
+    tmp = 2.0 * world::kPi * tmp / window_length_in_time;
+    main_window[i] = 0.42 + 0.5 * cos(tmp) + 0.08 * cos(2.0 * tmp);
   }
 }
 
@@ -459,7 +515,7 @@ static void GetMainWindow(double current_position, const int *base_index,
 // GetDiffWindow() generates the differentiated window.
 // Diff means differential.
 //-----------------------------------------------------------------------------
-static void GetDiffWindow(const double *main_window, int base_time_length,
+static inline void GetDiffWindow(const double *main_window, int base_time_length,
     double *diff_window) {
   diff_window[0] = -main_window[1] / 2.0;
   for (int i = 1; i < base_time_length - 1; ++i)
@@ -471,12 +527,11 @@ static void GetDiffWindow(const double *main_window, int base_time_length,
 // GetSpectra() calculates two spectra of the waveform windowed by windows
 // (main window and diff window).
 //-----------------------------------------------------------------------------
-static void GetSpectra(const double *x, int x_length, int fft_size,
+static inline void GetSpectra(const double *x, int x_length, int fft_size,
     const int *base_index, const double *main_window,
     const double *diff_window, int base_time_length,
     const ForwardRealFFT *forward_real_fft, fft_complex *main_spectrum,
-    fft_complex *diff_spectrum) {
-  int *safe_index = new int[base_time_length];
+    fft_complex *diff_spectrum, int *safe_index) {
 
   for (int i = 0; i < base_time_length; ++i)
     safe_index[i] = MyMaxInt(0, MyMinInt(x_length - 1, base_index[i] - 1));
@@ -500,19 +555,16 @@ static void GetSpectra(const double *x, int x_length, int fft_size,
     diff_spectrum[i][0] = forward_real_fft->spectrum[i][0];
     diff_spectrum[i][1] = forward_real_fft->spectrum[i][1];
   }
-
-  delete[] safe_index;
 }
 
-static void FixF0(const double *power_spectrum, const double *numerator_i,
+static inline void FixF0(const double *power_spectrum, const double *numerator_i,
     int fft_size, double fs, double current_f0, int number_of_harmonics,
-    double *refined_f0, double *score) {
-  double *amplitude_list = new double[number_of_harmonics];
-  double *instantaneous_frequency_list = new double[number_of_harmonics];
+    double &refined_f0, double &score) {
+  double amplitude_list[NUM_HARMONICS];
+  double instantaneous_frequency_list[NUM_HARMONICS];
 
-  int index;
   for (int i = 0; i < number_of_harmonics; ++i) {
-    index = matlab_round(current_f0 * fft_size / fs * (i + 1));
+    const int index = lround(current_f0 * fft_size / fs * (i + 1));
     instantaneous_frequency_list[i] = power_spectrum[index] == 0.0 ? 0.0 :
       static_cast<double>(index) * fs / fft_size +
       numerator_i[index] / power_spectrum[index] * fs / 2.0 / world::kPi;
@@ -520,100 +572,16 @@ static void FixF0(const double *power_spectrum, const double *numerator_i,
   }
   double denominator = 0.0;
   double numerator = 0.0;
-  *score = 0.0;
+  score = 0.0;
   for (int i = 0; i < number_of_harmonics; ++i) {
     numerator += amplitude_list[i] * instantaneous_frequency_list[i];
     denominator += amplitude_list[i] * (i + 1.0);
-    *score += fabs((instantaneous_frequency_list[i] / (i + 1.0) - current_f0) /
+    score += fabs((instantaneous_frequency_list[i] / (i + 1.0) - current_f0) /
       current_f0);
   }
 
-  *refined_f0 = numerator / (denominator + world::kMySafeGuardMinimum);
-  *score = 1.0 / (*score / number_of_harmonics + world::kMySafeGuardMinimum);
-
-  delete[] amplitude_list;
-  delete[] instantaneous_frequency_list;
-}
-
-//-----------------------------------------------------------------------------
-// GetMeanF0() calculates the instantaneous frequency.
-//-----------------------------------------------------------------------------
-static void GetMeanF0(const double *x, int x_length, double fs,
-    double current_position, double current_f0, int fft_size,
-    double window_length_in_time, const double *base_time,
-    int base_time_length, double *refined_f0, double *refined_score) {
-  ForwardRealFFT forward_real_fft = { 0 };
-  InitializeForwardRealFFT(fft_size, &forward_real_fft);
-  fft_complex *main_spectrum = new fft_complex[fft_size];
-  fft_complex *diff_spectrum = new fft_complex[fft_size];
-
-  int *base_index = new int[base_time_length];
-  double *main_window = new double[base_time_length];
-  double *diff_window = new double[base_time_length];
-
-  GetBaseIndex(current_position, base_time, base_time_length, fs, base_index);
-  GetMainWindow(current_position, base_index, base_time_length, fs,
-      window_length_in_time, main_window);
-  GetDiffWindow(main_window, base_time_length, diff_window);
-
-  GetSpectra(x, x_length, fft_size, base_index, main_window, diff_window,
-      base_time_length, &forward_real_fft, main_spectrum, diff_spectrum);
-
-  double *power_spectrum = new double[fft_size / 2 + 1];
-  double *numerator_i = new double[fft_size / 2 + 1];
-  for (int j = 0; j <= fft_size / 2; ++j) {
-    numerator_i[j] = main_spectrum[j][0] * diff_spectrum[j][1] -
-      main_spectrum[j][1] * diff_spectrum[j][0];
-    power_spectrum[j] = main_spectrum[j][0] * main_spectrum[j][0] +
-      main_spectrum[j][1] * main_spectrum[j][1];
-  }
-
-  int number_of_harmonics =
-    MyMinInt(static_cast<int>(fs / 2.0 / current_f0), 6);
-  FixF0(power_spectrum, numerator_i, fft_size, fs, current_f0,
-      number_of_harmonics, refined_f0, refined_score);
-
-  delete[] diff_spectrum;
-  delete[] diff_window;
-  delete[] main_window;
-  delete[] base_index;
-  delete[] numerator_i;
-  delete[] power_spectrum;
-  delete[] main_spectrum;
-  DestroyForwardRealFFT(&forward_real_fft);
-}
-
-//-----------------------------------------------------------------------------
-// GetRefinedF0() calculates F0 and its score based on instantaneous frequency.
-//-----------------------------------------------------------------------------
-static void GetRefinedF0(const double *x, int x_length, double fs,
-    double current_position, double current_f0, double f0_floor, double f0_ceil,
-    double *refined_f0, double *refined_score) {
-  if (current_f0 <= 0.0) {
-    *refined_f0 = 0.0;
-    *refined_score = 0.0;
-    return;
-  }
-
-  int half_window_length = static_cast<int>(1.5 * fs / current_f0 + 1.0);
-  double window_length_in_time = (2.0 * half_window_length + 1.0) / fs;
-  double *base_time = new double[half_window_length * 2 + 1];
-  for (int i = 0; i < half_window_length * 2 + 1; i++)
-    base_time[i] = (-half_window_length + i) / fs;
-  int fft_size = static_cast<int>(pow(2.0, 2.0 +
-    static_cast<int>(log(half_window_length * 2.0 + 1.0) / world::kLog2)));
-
-  GetMeanF0(x, x_length, fs, current_position, current_f0, fft_size,
-      window_length_in_time, base_time, half_window_length * 2 + 1,
-      refined_f0, refined_score);
-
-  if (*refined_f0 < f0_floor || *refined_f0 > f0_ceil ||
-      *refined_score < 2.5) {
-    *refined_f0 = 0.0;
-    *refined_score = 0.0;
-  }
-
-  delete[] base_time;
+  refined_f0 = numerator / (denominator + world::kMySafeGuardMinimum);
+  score = 1.0 / (score / number_of_harmonics + world::kMySafeGuardMinimum);
 }
 
 //-----------------------------------------------------------------------------
@@ -621,46 +589,151 @@ static void GetRefinedF0(const double *x, int x_length, double fs,
 //-----------------------------------------------------------------------------
 static void RefineF0Candidates(const double *x, int x_length, double fs,
     const double *temporal_positions, int f0_length, int max_candidates,
-    double f0_floor, double f0_ceil,
-    double **refined_f0_candidates, double **f0_scores) {
-  for (int i = 0; i < f0_length; i++)
-    for (int j = 0; j < max_candidates; ++j)
-      GetRefinedF0(x, x_length, fs, temporal_positions[i],
-          refined_f0_candidates[i][j], f0_floor, f0_ceil,
-          &refined_f0_candidates[i][j], &f0_scores[i][j]);
+    const HarvestOption *option,
+    double *const *refined_f0_candidates, double *const *f0_scores) {
+
+  const int max_half_window_length = static_cast<int>(1.5 * fs / option->f0_floor + 1.0);
+  const int max_fft_index = 2 + static_cast<int>(log(max_half_window_length * 2 + 1.0) / world::kLog2);
+  const int max_fft_size = 1 << max_fft_index;
+  const int max_base_time_length = max_half_window_length * 2 + 1;
+  const int min_half_window_length = static_cast<int>(1.5 * fs / option->f0_ceil + 1.0);
+  const int min_fft_index = 2 + static_cast<int>(log(min_half_window_length * 2 + 1.0) / world::kLog2);
+  const int num_fft = max_fft_index - min_fft_index + 1;
+
+  RefineF0Temp *tmps = new RefineF0Temp[option->num_thread];
+  for (int thread_id = 0; thread_id < option->num_thread; thread_id++) {
+    RefineF0Temp &tmp = tmps[thread_id];
+    tmp.main_spectrum = new fft_complex[max_fft_size];
+    tmp.diff_spectrum = new fft_complex[max_fft_size];
+    tmp.base_index = new int[max_base_time_length];
+    tmp.main_window = new double[max_base_time_length];
+    tmp.diff_window = new double[max_base_time_length];
+    tmp.power_spectrum = new double[(max_fft_size / 2 + 1)];
+    tmp.numerator_i = new double[(max_fft_size / 2 + 1)];
+    tmp.base_time = new double[max_base_time_length];
+    tmp.safe_index = new int[max_base_time_length];
+
+    tmp.forward_real_fft_list = new ForwardRealFFT[num_fft];
+    for (int i = 0; i < num_fft; i++) {
+      const int fft_size = 1 << (min_fft_index+i);
+      InitializeForwardRealFFT(fft_size, &tmp.forward_real_fft_list[i]);
+    }
+  }
+
+#ifdef _OPENMP
+#pragma omp parallel for num_threads(option->num_thread)
+#endif
+  for (int i = 0; i < f0_length; i++) {
+#ifdef _OPENMP
+    int thread_id = omp_get_thread_num();
+#else
+    const int thread_id = 0;
+#endif
+    RefineF0Temp &tmp = tmps[thread_id];
+    const double current_position = temporal_positions[i];
+
+    for (int j = 0; j < max_candidates; ++j) {
+      double &refined_f0 = refined_f0_candidates[i][j];
+      double &refined_score = f0_scores[i][j];
+      const double current_f0 = refined_f0;
+
+      if (current_f0 <= 0.0) {
+        refined_f0 = 0.0;
+        refined_score = 0.0;
+        continue;
+      }
+
+      const int half_window_length = static_cast<int>(1.5 * fs / current_f0 + 1.0);
+      const double window_length_in_time = (2.0 * half_window_length + 1.0) / fs;
+      for (int i = 0; i < half_window_length * 2 + 1; i++)
+        tmp.base_time[i] = (-half_window_length + i) / fs;
+      const int fft_index = 2 + static_cast<int>(log(half_window_length * 2.0 + 1.0) / world::kLog2);
+      const int fft_size = 1 << fft_index;
+      const int base_time_length = half_window_length * 2 + 1;
+
+      // calculates the instantaneous frequency
+      ForwardRealFFT &forward_real_fft = tmp.forward_real_fft_list[fft_index-min_fft_index];
+
+      GetBaseIndex(current_position, tmp.base_time, base_time_length, fs, tmp.base_index);
+      GetMainWindow(current_position, tmp.base_index, base_time_length, fs,
+                    window_length_in_time, tmp.main_window);
+      GetDiffWindow(tmp.main_window, base_time_length, tmp.diff_window);
+
+      GetSpectra(x, x_length, fft_size, tmp.base_index, tmp.main_window, tmp.diff_window,
+                 base_time_length, &forward_real_fft, tmp.main_spectrum, tmp.diff_spectrum, tmp.safe_index);
+
+      for (int j = 0; j <= fft_size / 2; ++j) {
+        tmp.numerator_i[j] = tmp.main_spectrum[j][0] * tmp.diff_spectrum[j][1] -
+                tmp.main_spectrum[j][1] * tmp.diff_spectrum[j][0];
+        tmp.power_spectrum[j] = tmp.main_spectrum[j][0] * tmp.main_spectrum[j][0] +
+                tmp.main_spectrum[j][1] * tmp.main_spectrum[j][1];
+      }
+
+      const int number_of_harmonics =
+              MyMinInt(static_cast<int>(fs / 2.0 / current_f0), NUM_HARMONICS);
+      FixF0(tmp.power_spectrum, tmp.numerator_i, fft_size, fs, current_f0,
+            number_of_harmonics, refined_f0, refined_score);
+
+      if (refined_f0 < option->f0_floor || refined_f0 > option->f0_ceil ||
+          refined_score < 2.5) {
+          refined_f0 = 0.0;
+          refined_score = 0.0;
+      }
+    }
+  }
+
+  for (int thread_id = option->num_thread-1; thread_id >= 0; thread_id--) {
+    RefineF0Temp &tmp = tmps[thread_id];
+
+    for (int i = num_fft-1; i >= 0; i--) {
+      DestroyForwardRealFFT(&tmp.forward_real_fft_list[i]);
+    }
+    delete[] tmp.forward_real_fft_list;
+
+    delete[] tmp.safe_index;
+    delete[] tmp.base_time;
+    delete[] tmp.numerator_i;
+    delete[] tmp.power_spectrum;
+    delete[] tmp.diff_window;
+    delete[] tmp.main_window;
+    delete[] tmp.base_index;
+    delete[] tmp.diff_spectrum;
+    delete[] tmp.main_spectrum;
+  }
+  delete[] tmps;
 }
 
 //-----------------------------------------------------------------------------
 // SelectBestF0() obtains the nearlest F0 in reference_f0.
 //-----------------------------------------------------------------------------
 static double SelectBestF0(double reference_f0, const double *f0_candidates,
-    int number_of_candidates, double allowed_range, double *best_error) {
+    int number_of_candidates, double allowed_range, double &best_error) {
   double best_f0 = 0.0;
-  *best_error = allowed_range;
+  best_error = allowed_range;
 
   double tmp;
   for (int i = 0; i < number_of_candidates; ++i) {
     tmp = fabs(reference_f0 - f0_candidates[i]) / reference_f0;
-    if (tmp > *best_error) continue;
+    if (tmp > best_error) continue;
     best_f0 = f0_candidates[i];
-    *best_error = tmp;
+    best_error = tmp;
   }
 
   return best_f0;
 }
 
 static void RemoveUnreliableCandidatesSub(int i, int j,
-    const double * const *tmp_f0_candidates, int number_of_candidates,
-    double **f0_candidates, double **f0_scores) {
+    const double *const *tmp_f0_candidates, int number_of_candidates,
+    double *const *f0_candidates, double *const *f0_scores) {
   double reference_f0 = f0_candidates[i][j];
   double error1, error2, min_error;
   double threshold = 0.05;
   if (reference_f0 == 0) return;
   SelectBestF0(reference_f0, tmp_f0_candidates[i + 1],
-      number_of_candidates, 1.0, &error1);
+      number_of_candidates, 1.0, error1);
   SelectBestF0(reference_f0, tmp_f0_candidates[i - 1],
-      number_of_candidates, 1.0, &error2);
-  min_error = MyMinDouble(error1, error2);
+      number_of_candidates, 1.0, error2);
+  min_error = fmin(error1, error2);
   if (min_error <= threshold) return;
   f0_candidates[i][j] = 0;
   f0_scores[i][j] = 0;
@@ -670,10 +743,9 @@ static void RemoveUnreliableCandidatesSub(int i, int j,
 // RemoveUnreliableCandidates().
 //-----------------------------------------------------------------------------
 static void RemoveUnreliableCandidates(int f0_length, int number_of_candidates,
-    double **f0_candidates, double **f0_scores) {
-  double **tmp_f0_candidates = new double *[f0_length];
-  for (int i = 0; i < f0_length; ++i)
-    tmp_f0_candidates[i] = new double[number_of_candidates];
+    double *const *f0_candidates, double *const *f0_scores) {
+
+  double **tmp_f0_candidates = Create2DArray<double>(f0_length, number_of_candidates);
   for (int i = 0; i < f0_length; ++i)
     for (int j = 0; j < number_of_candidates; ++j)
       tmp_f0_candidates[i][j] = f0_candidates[i][j];
@@ -683,15 +755,14 @@ static void RemoveUnreliableCandidates(int f0_length, int number_of_candidates,
       RemoveUnreliableCandidatesSub(i, j, tmp_f0_candidates,
           number_of_candidates, f0_candidates, f0_scores);
 
-  for (int i = 0; i < f0_length; ++i) delete[] tmp_f0_candidates[i];
-  delete[] tmp_f0_candidates;
+  Delete2DArray(tmp_f0_candidates);
 }
 
 //-----------------------------------------------------------------------------
 // SearchF0Base() gets the F0 with the highest score.
 //-----------------------------------------------------------------------------
-static void SearchF0Base(const double * const *f0_candidates,
-    const double * const *f0_scores, int f0_length, int number_of_candidates,
+static void SearchF0Base(const double *const *f0_candidates,
+    const double *const *f0_scores, int f0_length, int number_of_candidates,
     double *base_f0_contour) {
   double tmp_best_score;
   for (int i = 0; i < f0_length; ++i) {
@@ -766,7 +837,7 @@ static void FixStep2(const double *f0_step1, int f0_length,
 //-----------------------------------------------------------------------------
 static void GetMultiChannelF0(const double *f0, int f0_length,
     const int *boundary_list, int number_of_boundaries,
-    double **multi_channel_f0) {
+    double *const *multi_channel_f0) {
   for (int i = 0; i < number_of_boundaries / 2; ++i) {
     for (int j = 0; j < boundary_list[i * 2]; ++j)
       multi_channel_f0[i][j] = 0.0;
@@ -789,7 +860,7 @@ static inline int MyAbsInt(int x) {
 // The subfunction of Extend().
 //-----------------------------------------------------------------------------
 static int ExtendF0(const double *f0, int f0_length, int origin,
-    int last_point, int shift, const double * const *f0_candidates,
+    int last_point, int shift, const double *const *f0_candidates,
     int number_of_candidates, double allowed_range, double *extended_f0) {
   int threshold = 4;
   double tmp_f0 = extended_f0[origin];
@@ -800,11 +871,11 @@ static int ExtendF0(const double *f0, int f0_length, int origin,
   for (int i = 0; i <= distance; ++i) index_list[i] = origin + shift * i;
 
   int count = 0;
-  double dammy;
   for (int i = 0; i <= distance; ++i) {
+    double dammy;
     extended_f0[index_list[i] + shift] =
       SelectBestF0(tmp_f0, f0_candidates[index_list[i] + shift],
-      number_of_candidates, allowed_range, &dammy);
+      number_of_candidates, allowed_range, dammy);
     if (extended_f0[index_list[i] + shift] == 0.0) {
       count++;
     } else {
@@ -821,47 +892,25 @@ static int ExtendF0(const double *f0, int f0_length, int origin,
 
 //-----------------------------------------------------------------------------
 // Swap the f0 contour and boundary.
-// It is used in ExtendSub() and MergeF0();
+// It is used in Extend() and MergeF0();
 //-----------------------------------------------------------------------------
-static void Swap(int index1, int index2, double **f0, int *boundary) {
-  double *tmp_pointer;
-  int tmp_index;
-  tmp_pointer = f0[index1];
-  f0[index1] = f0[index2];
-  f0[index2] = tmp_pointer;
-  tmp_index = boundary[index1 * 2];
-  boundary[index1 * 2] = boundary[index2 * 2];
-  boundary[index2 * 2] = tmp_index;
-  tmp_index = boundary[index1 * 2 + 1];
-  boundary[index1 * 2 + 1] = boundary[index2 * 2 + 1];
-  boundary[index2 * 2 + 1] = tmp_index;
-}
-
-static int ExtendSub(const double * const *extended_f0,
-    const int *boundary_list, int number_of_sections,
-    double **selected_extended_f0, int *selected_boundary_list) {
-  double threshold = 2200.0;
-  int count = 0;
-  double mean_f0 = 0.0;
-  int st, ed;
-  for (int i = 0; i < number_of_sections; ++i) {
-    st = boundary_list[i * 2];
-    ed = boundary_list[i * 2 + 1];
-    for (int j = st; j < ed; ++j) mean_f0 += extended_f0[i][j];
-    mean_f0 /= ed - st;
-    if (threshold / mean_f0 < ed - st)
-      Swap(count++, i, selected_extended_f0, selected_boundary_list);
+static inline void Swap(int index1, int index2, int f0_length, double *const *f0, int *boundary) {
+  double* f0_i1 = f0[index1];
+  double* f0_i2 = f0[index2];
+  for(int i=0; i < f0_length; i++) {
+    std::swap(f0_i1[i], f0_i2[i]);
   }
-  return count;
+  std::swap(boundary[index1 * 2], boundary[index2 * 2]);
+  std::swap(boundary[index1 * 2 + 1], boundary[index2 * 2 + 1]);
 }
 
 //-----------------------------------------------------------------------------
 // Extend() : The Hand erasing the Space.
 //-----------------------------------------------------------------------------
-static int Extend(const double * const *multi_channel_f0,
+static int Extend(const double *const *multi_channel_f0,
     int number_of_sections, int f0_length, const int *boundary_list,
-    const double * const *f0_candidates, int number_of_candidates,
-    double allowed_range, double **extended_f0, int *shifted_boundary_list) {
+    const double *const *f0_candidates, int number_of_candidates,
+    double allowed_range, double *const *extended_f0, int *shifted_boundary_list) {
   int threshold = 100;
   for (int i = 0; i < number_of_sections; ++i) {
     shifted_boundary_list[i * 2 + 1] = ExtendF0(multi_channel_f0[i],
@@ -873,8 +922,19 @@ static int Extend(const double * const *multi_channel_f0,
       f0_candidates, number_of_candidates, allowed_range, extended_f0[i]);
   }
 
-  return ExtendSub(multi_channel_f0, shifted_boundary_list,
-    number_of_sections, extended_f0, shifted_boundary_list);
+  double threshold2 = 2200.0;
+  int count = 0;
+  double mean_f0 = 0.0;
+  int st, ed;
+  for (int i = 0; i < number_of_sections; ++i) {
+    st = boundary_list[i * 2];
+    ed = boundary_list[i * 2 + 1];
+    for (int j = st; j < ed; ++j) mean_f0 += multi_channel_f0[i][j];
+    mean_f0 /= ed - st;
+    if (threshold2 / mean_f0 < ed - st)
+      Swap(count++, i, f0_length, extended_f0, shifted_boundary_list);
+  }
+  return count;
 }
 
 //-----------------------------------------------------------------------------
@@ -898,8 +958,8 @@ static void MakeSortedOrder(const int *boundary_list, int number_of_sections,
 //-----------------------------------------------------------------------------
 // Serach the highest score with the candidate F0.
 //-----------------------------------------------------------------------------
-static double SearchScore(double f0, const double *f0_candidates,
-    const double  *f0_scores, int number_of_candidates) {
+static inline double SearchScore(double f0, const double *f0_candidates,
+    const double *f0_scores, int number_of_candidates) {
   double score = 0.0;
   for (int i = 0; i < number_of_candidates; ++i)
     if (f0 == f0_candidates[i] && score < f0_scores[i]) score = f0_scores[i];
@@ -910,8 +970,8 @@ static double SearchScore(double f0, const double *f0_candidates,
 // Subfunction of MergeF0()
 //-----------------------------------------------------------------------------
 static int MergeF0Sub(const double *f0_1, int f0_length, int st1, int ed1,
-    const double *f0_2, int st2, int ed2, const double * const *f0_candidates,
-    const double * const *f0_scores, int number_of_candidates,
+    const double *f0_2, int st2, int ed2, const double *const *f0_candidates,
+    const double *const *f0_scores, int number_of_candidates,
     double *merged_f0) {
   if (st1 <= st2 && ed1 >= ed2) return ed1;
 
@@ -934,9 +994,9 @@ static int MergeF0Sub(const double *f0_1, int f0_length, int st1, int ed1,
 //-----------------------------------------------------------------------------
 // Overlapped F0 contours are merged by the likability score.
 //-----------------------------------------------------------------------------
-static void MergeF0(const double * const *multi_channel_f0, int *boundary_list,
-    int number_of_channels, int f0_length, const double * const *f0_candidates,
-    const double * const *f0_scores, int number_of_candidates,
+static void MergeF0(const double *const *multi_channel_f0, int *boundary_list,
+    int number_of_channels, int f0_length, const double *const *f0_candidates,
+    const double *const *f0_scores, int number_of_candidates,
     double *merged_f0) {
   int *order = new int[number_of_channels];
   MakeSortedOrder(boundary_list, number_of_channels, order);
@@ -966,16 +1026,14 @@ static void MergeF0(const double * const *multi_channel_f0, int *boundary_list,
 // Step 3: Voiced sections are extended based on the continuity of F0 contour
 //-----------------------------------------------------------------------------
 static void FixStep3(const double *f0_step2, int f0_length,
-    int number_of_candidates, const double * const *f0_candidates,
-    double allowed_range, const double * const *f0_scores, double *f0_step3) {
+    int number_of_candidates, const double *const *f0_candidates,
+    double allowed_range, const double *const *f0_scores, double *f0_step3) {
   for (int i = 0; i < f0_length; ++i) f0_step3[i] = f0_step2[i];
   int *boundary_list = new int[f0_length];
   int number_of_boundaries =
     GetBoundaryList(f0_step2, f0_length, boundary_list);
 
-  double **multi_channel_f0 = new double *[number_of_boundaries / 2];
-  for (int i = 0; i < number_of_boundaries / 2; ++i)
-    multi_channel_f0[i] = new double[f0_length];
+  double **multi_channel_f0 = Create2DArray<double>(number_of_boundaries, f0_length);
   GetMultiChannelF0(f0_step2, f0_length, boundary_list, number_of_boundaries,
       multi_channel_f0);
 
@@ -988,9 +1046,7 @@ static void FixStep3(const double *f0_step2, int f0_length,
     MergeF0(multi_channel_f0, boundary_list, number_of_channels, f0_length,
         f0_candidates, f0_scores, number_of_candidates, f0_step3);
 
-  for (int i = 0; i < number_of_boundaries / 2; ++i)
-    delete[] multi_channel_f0[i];
-  delete[] multi_channel_f0;
+  Delete2DArray(multi_channel_f0);
   delete[] boundary_list;
 }
 
@@ -1024,8 +1080,8 @@ static void FixStep4(const double *f0_step3, int f0_length, int threshold,
 //-----------------------------------------------------------------------------
 // FixF0Contour() obtains the likely F0 contour.
 //-----------------------------------------------------------------------------
-static void FixF0Contour(const double * const *f0_candidates,
-    const double * const *f0_scores, int f0_length, int number_of_candidates,
+static void FixF0Contour(const double *const *f0_candidates,
+    const double *const *f0_scores, int f0_length, int number_of_candidates,
     double *best_f0_contour) {
   double *tmp_f0_contour1 = new double[f0_length];
   double *tmp_f0_contour2 = new double[f0_length];
@@ -1039,8 +1095,8 @@ static void FixF0Contour(const double * const *f0_candidates,
       0.18, f0_scores, tmp_f0_contour2);
   FixStep4(tmp_f0_contour2, f0_length, 9, best_f0_contour);
 
-  delete[] tmp_f0_contour1;
   delete[] tmp_f0_contour2;
+  delete[] tmp_f0_contour1;
 }
 
 //-----------------------------------------------------------------------------
@@ -1092,9 +1148,7 @@ static void SmoothF0Contour(const double *f0, int f0_length,
   int *boundary_list = new int[new_f0_length];
   int number_of_boundaries =
     GetBoundaryList(f0_contour, new_f0_length, boundary_list);
-  double **multi_channel_f0 = new double *[number_of_boundaries / 2];
-  for (int i = 0; i < number_of_boundaries / 2; ++i)
-    multi_channel_f0[i] = new double[new_f0_length];
+  double **multi_channel_f0 = Create2DArray<double>(number_of_boundaries / 2, new_f0_length);
   GetMultiChannelF0(f0_contour, new_f0_length, boundary_list,
       number_of_boundaries, multi_channel_f0);
 
@@ -1105,11 +1159,9 @@ static void SmoothF0Contour(const double *f0, int f0_length,
       smoothed_f0[j - lag] = f0_contour[j];
   }
 
-  for (int i = 0; i < number_of_boundaries / 2; ++i)
-    delete[] multi_channel_f0[i];
-  delete[] multi_channel_f0;
-  delete[] f0_contour;
+  Delete2DArray(multi_channel_f0);
   delete[] boundary_list;
+  delete[] f0_contour;
 }
 
 //-----------------------------------------------------------------------------
@@ -1118,24 +1170,21 @@ static void SmoothF0Contour(const double *f0, int f0_length,
 static int HarvestGeneralBodySub(const double *boundary_f0_list,
     int number_of_channels, int f0_length, double actual_fs, int y_length,
     const double *temporal_positions, const fft_complex *y_spectrum,
-    int fft_size, double f0_floor, double f0_ceil, int max_candidates,
-    double **f0_candidates) {
-  double **raw_f0_candidates = new double *[number_of_channels];
-  for (int i = 0; i < number_of_channels; ++i)
-    raw_f0_candidates[i] = new double[f0_length];
+    int fft_size, const HarvestOption *option, int max_candidates,
+    double *const *f0_candidates) {
+
+  double **raw_f0_candidates = Create2DArray<double>(number_of_channels, f0_length);
 
   GetRawF0Candidates(boundary_f0_list, number_of_channels,
       actual_fs, y_length, temporal_positions, f0_length, y_spectrum,
-      fft_size, f0_floor, f0_ceil, raw_f0_candidates);
+      fft_size, option, raw_f0_candidates);
 
   int number_of_candidates = DetectOfficialF0Candidates(raw_f0_candidates,
-    number_of_channels, f0_length, max_candidates, f0_candidates);
+    number_of_channels, f0_length, option, max_candidates, f0_candidates);
 
   OverlapF0Candidates(f0_length, number_of_candidates, f0_candidates);
 
-  for (int i = 0; i < number_of_channels; ++i)
-    delete[] raw_f0_candidates[i];
-  delete[] raw_f0_candidates;
+  Delete2DArray(raw_f0_candidates);
   return number_of_candidates;
 }
 
@@ -1143,18 +1192,17 @@ static int HarvestGeneralBodySub(const double *boundary_f0_list,
 // HarvestGeneralBody() estimates the F0 contour based on Harvest.
 //-----------------------------------------------------------------------------
 static void HarvestGeneralBody(const double *x, int x_length, int fs,
-    int frame_period, double f0_floor, double f0_ceil,
-    double channels_in_octave, int speed, double *temporal_positions,
+    int frame_period, const HarvestOption *option, int speed, double *temporal_positions,
     double *f0) {
-  double adjusted_f0_floor = f0_floor * 0.9;
-  double adjusted_f0_ceil = f0_ceil * 1.1;
+  double adjusted_f0_floor = option->f0_floor * 0.9;
+  double adjusted_f0_ceil = option->f0_ceil * 1.1;
   int number_of_channels =
     1 + static_cast<int>(log(adjusted_f0_ceil / adjusted_f0_floor) /
-    world::kLog2 * channels_in_octave);
+    world::kLog2 * option->channels_in_octave);
   double *boundary_f0_list = new double[number_of_channels];
   for (int i = 0; i < number_of_channels; ++i)
     boundary_f0_list[i] =
-    adjusted_f0_floor * pow(2.0, (i + 1) / channels_in_octave);
+            adjusted_f0_floor * pow(2.0, (i + 1) / option->channels_in_octave);
 
   // normalization
   int decimation_ratio = MyMaxInt(MyMinInt(speed, 12), 1);
@@ -1178,21 +1226,17 @@ static void HarvestGeneralBody(const double *x, int x_length, int fs,
 
   int overlap_parameter = 7;
   int max_candidates =
-    matlab_round(number_of_channels / 10.0) * overlap_parameter;
-  double **f0_candidates = new double *[f0_length];
-  double **f0_candidates_score = new double *[f0_length];
-  for (int i = 0; i < f0_length; ++i) {
-    f0_candidates[i] = new double[max_candidates];
-    f0_candidates_score[i] = new double[max_candidates];
-  }
+    lround(number_of_channels / 10.0) * overlap_parameter;
+  double **f0_candidates = Create2DArray<double>(f0_length, max_candidates);
+  double **f0_candidates_score = Create2DArray<double>(f0_length, max_candidates);
 
   int number_of_candidates = HarvestGeneralBodySub(boundary_f0_list,
     number_of_channels, f0_length, actual_fs, y_length, temporal_positions,
-    y_spectrum, fft_size, f0_floor, f0_ceil, max_candidates, f0_candidates) *
+    y_spectrum, fft_size, option, max_candidates, f0_candidates) *
     overlap_parameter;
 
   RefineF0Candidates(y, y_length, actual_fs, temporal_positions, f0_length,
-      number_of_candidates, f0_floor, f0_ceil, f0_candidates,
+      number_of_candidates, option, f0_candidates,
       f0_candidates_score);
   RemoveUnreliableCandidates(f0_length, number_of_candidates,
       f0_candidates, f0_candidates_score);
@@ -1202,15 +1246,11 @@ static void HarvestGeneralBody(const double *x, int x_length, int fs,
       number_of_candidates, best_f0_contour);
   SmoothF0Contour(best_f0_contour, f0_length, f0);
 
-  delete[] y;
   delete[] best_f0_contour;
+  Delete2DArray(f0_candidates_score);
+  Delete2DArray(f0_candidates);
   delete[] y_spectrum;
-  for (int i = 0; i < f0_length; ++i) {
-    delete[] f0_candidates[i];
-    delete[] f0_candidates_score[i];
-  }
-  delete[] f0_candidates;
-  delete[] f0_candidates_score;
+  delete[] y;
   delete[] boundary_f0_list;
 }
 
@@ -1222,14 +1262,10 @@ int GetSamplesForHarvest(int fs, int x_length, double frame_period) {
 
 void Harvest(const double *x, int x_length, int fs,
     const HarvestOption *option, double *temporal_positions, double *f0) {
-  // Several parameters will be controllable for debug.
-  double target_fs = 8000.0;
-  int dimension_ratio = matlab_round(fs / target_fs);
-  double channels_in_octave = 40;
+  int dimension_ratio = lround(fs / option->target_fs);
 
   if (option->frame_period == 1.0) {
-    HarvestGeneralBody(x, x_length, fs, 1, option->f0_floor,
-        option->f0_ceil, channels_in_octave, dimension_ratio,
+    HarvestGeneralBody(x, x_length, fs, 1, option, dimension_ratio,
         temporal_positions, f0);
     return;
   }
@@ -1239,24 +1275,32 @@ void Harvest(const double *x, int x_length, int fs,
     GetSamplesForHarvest(fs, x_length, basic_frame_period);
   double *basic_f0 = new double[basic_f0_length];
   double *basic_temporal_positions = new double[basic_f0_length];
-  HarvestGeneralBody(x, x_length, fs, basic_frame_period, option->f0_floor,
-      option->f0_ceil, channels_in_octave, dimension_ratio,
+  HarvestGeneralBody(x, x_length, fs, basic_frame_period, option, dimension_ratio,
       basic_temporal_positions, basic_f0);
 
   int f0_length = GetSamplesForHarvest(fs, x_length, option->frame_period);
   for (int i = 0; i < f0_length; ++i) {
     temporal_positions[i] = i * option->frame_period / 1000.0;
     f0[i] = basic_f0[MyMinInt(basic_f0_length - 1,
-      matlab_round(temporal_positions[i] * 1000.0))];
+      lround(temporal_positions[i] * 1000.0))];
   }
 
-  delete[] basic_f0;
   delete[] basic_temporal_positions;
+  delete[] basic_f0;
 }
 
 void InitializeHarvestOption(HarvestOption *option) {
+#ifdef _OPENMP
+  option->num_thread = omp_get_num_procs();
+#else
+  option->num_thread = 1;
+#endif
+
   // You can change default parameters.
   option->f0_ceil = world::kCeilF0;
   option->f0_floor = world::kFloorF0;
   option->frame_period = 5;
+  option->target_fs = 8000;
+  option->channels_in_octave = 40;
+  option->f0_sub2 = 10;
 }

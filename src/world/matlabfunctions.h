@@ -65,6 +65,8 @@ void histc(const double *x, int x_length, const double *edges,
 //-----------------------------------------------------------------------------
 void interp1(const double *x, const double *y, int x_length, const double *xi,
   int xi_length, double *yi);
+void interp1a(const double *x, const double *y, int x_length, const double *xi,
+             int xi_length, double *yi, double *s, int *k);
 
 //-----------------------------------------------------------------------------
 // decimate() carries out down sampling by both IIR and FIR filters.

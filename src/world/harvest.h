@@ -14,9 +14,13 @@ WORLD_BEGIN_C_DECLS
 // Struct for Harvest
 //-----------------------------------------------------------------------------
 typedef struct {
+  int num_thread;
   double f0_floor;
   double f0_ceil;
   double frame_period;
+  double target_fs;
+  double channels_in_octave;
+  int f0_sub2;
 } HarvestOption;
 
 //-----------------------------------------------------------------------------
