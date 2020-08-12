@@ -53,6 +53,7 @@ struct GetRawF0Temp {
 
   double *interp1_s;
   int *interp1_k;
+  world_t **interpolated_f0_set;  
 };
 
 struct RefineF0Temp {
@@ -348,8 +349,6 @@ static void GetRawF0Candidates(const double *boundary_f0_list,
     const fft_complex *y_spectrum, int fft_size, const HarvestOption *option,
     double *const *raw_f0_candidates) {
 
-  double **interpolated_f0_set = Create2DArray<double>(4, f0_length);
-
   GetRawF0Temp *tmps = new GetRawF0Temp[option->num_thread];
   for (int thread_id = 0; thread_id < option->num_thread; thread_id++) {
     GetRawF0Temp &tmp = tmps[thread_id];
@@ -361,6 +360,7 @@ static void GetRawF0Candidates(const double *boundary_f0_list,
 
     tmp.interp1_s = new double[f0_length];
     tmp.interp1_k = new int[f0_length];
+    tmp.interpolated_f0_set = Create2DArray<world_t>(4, f0_length);
   }
 
 #ifdef _OPENMP
@@ -385,14 +385,13 @@ static void GetRawF0Candidates(const double *boundary_f0_list,
 
     GetF0CandidateContour(&tmp.zero_crossings, boundary_f0, option,
       temporal_positions, f0_length, raw_f0_candidates[i],
-      interpolated_f0_set, tmp.interp1_s, tmp.interp1_k);
+      tmp.interpolated_f0_set, tmp.interp1_s, tmp.interp1_k);
   }
-
-  Delete2DArray<double>(interpolated_f0_set);
 
   for (int thread_id = option->num_thread-1; thread_id >= 0; thread_id--) {
     GetRawF0Temp &tmp = tmps[thread_id];
 
+    Delete2DArray<world_t>(tmp.interpolated_f0_set);
     delete[] tmp.interp1_k;
     delete[] tmp.interp1_s;
     delete[] tmp.band_pass_filter_spectrum;
